@@ -36,7 +36,7 @@ task3/
     └── report_D.md
 ```
 
-**8 Python files total. Do not add more without telling the team.**
+**7 Python files total. Do not add more without telling the team.**
 
 ---
 
@@ -62,10 +62,11 @@ task3/
 1. **No OpenCV algorithms** — forbidden: `cv2.cornerHarris`, `cv2.SIFT_create`, `cv2.BFMatcher`, `cv2.FlannBasedMatcher`. Only use `cv2` for image I/O (`imread`, `imwrite`, `cvtColor`) and drawing (`circle`, `line`, `drawMatches`-equivalent you build yourself).
 2. **SciPy Gaussian is allowed** — `scipy.ndimage.gaussian_filter` is fine for the structure tensor smoothing and scale-space blurring.
 3. **NumPy only for math** — all matrix ops use NumPy.
-4. **Timing is required** — every public function returns its execution time. Use `time.perf_counter()`.
+4. **Timing is required** — every function that the UI calls directly must return `time_ms`. That means: `harris_detection`, `lambda_minus_detection`, `build_scale_space`, `detect_keypoints`, `compute_descriptors`, `match_ssd`, `match_ncc`. Use `time.perf_counter()`. Helper functions (`build_dog`, `compute_orientations`, `draw_matches`) do not need to return timing.
 5. **Caching rule** — scale space is expensive to compute. Build it once and store it in `ui.py`. If the user only changes the keypoint threshold, skip rebuilding the scale space.
-6. **Grayscale for all detectors** — convert to grayscale before passing to harris.py, sift_detector.py, sift_descriptor.py.
-7. **Report observations** — each team member collects screenshots and writes `report/report_X.md` before the discussion.
+6. **NMS required in harris.py** — after thresholding, apply non-maximum suppression so each physical corner produces one point, not a blob. Use `scipy.ndimage.maximum_filter` to keep only local maxima in a small window (3×3 or 5×5). See GUIDE_B_harris.md for the implementation.
+7. **Grayscale for all detectors** — convert to grayscale before passing to harris.py, sift_detector.py, sift_descriptor.py.
+8. **Report observations** — each team member collects screenshots and writes `report/report_X.md` before the discussion.
 
 ---
 
