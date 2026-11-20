@@ -22,7 +22,7 @@ Build a **PyQt5 desktop application** with three tabs:
 ## §2 File Structure
 
 ```
-task3/
+features-matching-cv-task3/    ← repo root (no subfolder; all files live here)
 ├── main.py              ← Lead: entry point, QApplication
 ├── ui.py                ← Lead: MainWindow, 3 tabs, all controls
 ├── image_io.py          ← Lead: load/save/display helpers
@@ -30,15 +30,16 @@ task3/
 ├── sift_detector.py     ← C: scale space, DoG, keypoint detection
 ├── sift_descriptor.py   ← D: orientation assignment + 128-vector descriptors
 ├── matching.py          ← Lead: SSD matching, NCC matching, draw_matches
-└── report/
-    ├── report_B.md
-    ├── report_C.md
-    └── report_D.md
+├── requirements.txt
+└── guide files/         ← one guide per member; each member keeps theirs in sync (§4.8)
+    ├── GUIDE_B_harris.md
+    ├── GUIDE_C_sift_detector.md
+    └── GUIDE_D_sift_descriptor.md
 ```
 
 **7 Python files total. Do not add more without telling the team.**
 
-> **Guide files** (`GUIDE_B_harris.md`, `GUIDE_C_sift_detector.md`, `GUIDE_D_sift_descriptor.md`) already exist alongside this file. Hand them to each team member before Phase 0. They are reference documents, not part of the Python package.
+> **Guide files** (`GUIDE_B_harris.md`, `GUIDE_C_sift_detector.md`, `GUIDE_D_sift_descriptor.md`) live in the `guide files/` folder at the repo root. Hand them to each team member before Phase 0. They are reference documents, not part of the Python package.
 
 ---
 
@@ -53,9 +54,9 @@ task3/
 | `harris.py` | **B** | image_io (load only) |
 | `sift_detector.py` | **C** | image_io (load only) |
 | `sift_descriptor.py` | **D** | sift_detector (keypoints input) |
-| `report/report_B.md` | B | — |
-| `report/report_C.md` | C | — |
-| `report/report_D.md` | D | — |
+| `guide files/GUIDE_B_harris.md` | B | — |
+| `guide files/GUIDE_C_sift_detector.md` | C | — |
+| `guide files/GUIDE_D_sift_descriptor.md` | D | — |
 
 ---
 
@@ -68,7 +69,7 @@ task3/
 5. **Caching rule** — scale space is expensive to compute. Build it once and store it in `ui.py`. If the user only changes the keypoint threshold, skip rebuilding the scale space.
 6. **NMS required in harris.py** — after thresholding, apply non-maximum suppression so each physical corner produces one point, not a blob. Use `scipy.ndimage.maximum_filter` to keep only local maxima in a small window (3×3 or 5×5). See GUIDE_B_harris.md for the implementation.
 7. **Grayscale for all detectors** — convert to grayscale before passing to harris.py, sift_detector.py, sift_descriptor.py.
-8. **Report observations** — each team member collects screenshots and writes `report/report_X.md` before the discussion.
+8. **Keep your guide in sync (mandatory)** — there are no separate report files. Each member edits their own guide: any change to a concept, formula, step or parameter is written into the guide (explanation + code skeleton) and logged in its **Change Log**; screenshots and observations go in its **Your Observations** section. Every part of the code has a brief comment saying what it computes and why.
 
 ---
 
@@ -101,7 +102,7 @@ def show_in_label(label: QLabel, img: np.ndarray) -> None:
 ```python
 def compute_structure_tensor(
     img: np.ndarray,          # (H,W) float64 grayscale
-    sigma: float = 1.0,       # Gaussian sigma for image derivatives (Sobel pre-blur)
+    sigma: float = 1.0,       # kept for the UI call; NOT used (standard Harris: Sobel, no pre-blur)
     window_size: int = 3      # Integration window: passed directly as sigma to
                               # scipy.ndimage.gaussian_filter when smoothing Ix², Iy², Ix·Iy.
                               # Rule: use window_size AS the sigma value, not as a pixel count.
@@ -168,7 +169,8 @@ def build_dog(
 def detect_keypoints(
     dog: list[list[np.ndarray]],
     threshold: float = 0.03,  # contrast threshold
-    border: int = 5           # ignore pixels this close to edge
+    border: int = 5,          # ignore pixels this close to edge
+    sigma0: float = 1.6       # same base sigma used in build_scale_space (for the 'sigma' key)
 ) -> tuple[list[dict], float]:
     """
     Find local extrema in 3D (x, y, scale) DoG space.
@@ -178,11 +180,17 @@ def detect_keypoints(
 
     Returns:
       keypoints: list of dicts with keys:
-                 'x', 'y'       — pixel location in that octave
+                 'x', 'y'       — pixel location in that octave's (downsampled) image
+                 'x_img','y_img'— x * 2**octave, y * 2**octave (original full-size image coords)
                  'octave'       — octave index
                  'scale'        — scale index within octave
-                 'sigma'        — effective sigma at this keypoint
+                 'sigma'        — effective sigma in that octave's pixels: sigma0 * k**scale
+                 'sigma_img'    — sigma * 2**octave (keypoint size in original-image pixels)
       time_ms  : detection time in ms
+
+    Note: C must add x_img, y_img and sigma_img before returning. D, ui.py, and
+    draw_matches use x_img/y_img for any indexing into the original image, and
+    sigma_img for any window or circle size on the original image.
     """
 ```
 
@@ -357,7 +365,8 @@ if only threshold changed → reuse stored descriptors → match only
 ```
 [Load Image]
 Image display (left) | Response map display (right)
-[Method: Harris | Lambda-Minus]  [k=0.05]  [threshold=0.01]  [sigma=1.0]
+[Method: Harris | Lambda-Minus]  [k=0.05]  [threshold=0.01]  [window_size=3]
+(no sigma control — Harris uses no pre-blur; sigma keeps its default in the call)
 [Run Detection]   Time: -- ms   Corners found: --
 ```
 
@@ -383,7 +392,7 @@ Side-by-side match result
 
 Paste this prompt to generate the empty skeleton:
 
-> Read CLAUDE.md. Create all 7 Python files with the exact function signatures from §6. Every function body should be `raise NotImplementedError`. Add all imports at the top of each file. Create the `report/` directory with empty `report_B.md`, `report_C.md`, `report_D.md` files.
+> Read CLAUDE.md. Create all 7 Python files with the exact function signatures from §6. Every function body should be `raise NotImplementedError`. Add all imports at the top of each file.
 
 Then hand each team member their guide file.
 
