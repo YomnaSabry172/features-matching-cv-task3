@@ -38,6 +38,8 @@ task3/
 
 **7 Python files total. Do not add more without telling the team.**
 
+> **Guide files** (`GUIDE_B_harris.md`, `GUIDE_C_sift_detector.md`, `GUIDE_D_sift_descriptor.md`) already exist alongside this file. Hand them to each team member before Phase 0. They are reference documents, not part of the Python package.
+
 ---
 
 ## §3 Team Ownership
@@ -99,8 +101,11 @@ def show_in_label(label: QLabel, img: np.ndarray) -> None:
 ```python
 def compute_structure_tensor(
     img: np.ndarray,          # (H,W) float64 grayscale
-    sigma: float = 1.0,       # Gaussian sigma for derivatives
-    window_size: int = 3      # Gaussian window for M smoothing
+    sigma: float = 1.0,       # Gaussian sigma for image derivatives (Sobel pre-blur)
+    window_size: int = 3      # Integration window: passed directly as sigma to
+                              # scipy.ndimage.gaussian_filter when smoothing Ix², Iy², Ix·Iy.
+                              # Rule: use window_size AS the sigma value, not as a pixel count.
+                              # e.g. window_size=3 → gaussian_filter(..., sigma=3)
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Returns (Ixx, Ixy, Iyy) — the three components of the
@@ -309,18 +314,39 @@ User loads image 1 + image 2
 
 ## §8 Caching Rules
 
+**Core principle: compute once, reuse. Never repeat an expensive step because a cheap parameter changed.**
+
 | What | When to build | When NOT to rebuild |
 |------|---------------|---------------------|
-| Scale space | First Run SIFT click | Same image, only threshold changed |
-| Descriptors | After detect_keypoints | Same keypoints, threshold unchanged |
+| Scale space | Image loaded or changed | Same image, only keypoint threshold changed |
+| DoG | Right after scale space | Same scale space |
+| Descriptors | After detect_keypoints | Same keypoints, same image |
 | Harris R map | Every Run Detection click | — |
+| Tab 3 descriptors | When image loaded in Tab 3 | **Only threshold changed → just re-run match_ssd/match_ncc on stored descriptors** |
+
+**The Tab 3 redundancy trap** (Lead must handle this):  
+Tab 3 runs SIFT on two images. The expensive part is building the scale space and descriptors. These must be cached per image. Only `match_ssd` / `match_ncc` reruns when the user changes the matching threshold — never the full SIFT pipeline.
 
 In `ui.py`, store:
 ```python
-self._scale_space = None   # built by sift_detector
-self._dog         = None   # built by sift_detector
-self._kp1, self._desc1 = None, None   # for Tab 3 image 1
-self._kp2, self._desc2 = None, None   # for Tab 3 image 2
+# Tab 2
+self._scale_space2 = None   # scale space for Tab 2 image
+self._dog2         = None
+self._kp2_tab      = None
+self._desc2_tab    = None
+
+# Tab 3 — two separate image caches
+self._kp1,  self._desc1  = None, None   # image 1
+self._kp2,  self._desc2  = None, None   # image 2
+# scale space for Tab 3 images (optional but avoids rebuild on threshold change)
+self._ss_img1 = None
+self._ss_img2 = None
+```
+
+**Decision rule for Tab 3 "Run Matching" click:**
+```
+if image changed → rebuild scale_space → dog → keypoints → descriptors → match
+if only threshold changed → reuse stored descriptors → match only
 ```
 
 ---
@@ -340,7 +366,7 @@ Image display (left) | Response map display (right)
 [Load Image]
 Image with keypoints + arrows
 [n_octaves=4]  [n_scales=5]  [sigma0=1.6]  [kp_threshold=0.03]
-[Run SIFT]   Build time: -- ms   Detect time: -- ms   Keypoints: --
+[Run SIFT]   Build time: -- ms   Detect time: -- ms   Descriptor time: -- ms   Keypoints: --
 ```
 
 ### Tab 3 — Feature Matching
@@ -357,7 +383,7 @@ Side-by-side match result
 
 Paste this prompt to generate the empty skeleton:
 
-> Read CLAUDE.md. Create all 8 Python files with the exact function signatures from §6. Every function body should be `raise NotImplementedError`. Add all imports at the top of each file. Create the `report/` directory with empty `report_B.md`, `report_C.md`, `report_D.md` files.
+> Read CLAUDE.md. Create all 7 Python files with the exact function signatures from §6. Every function body should be `raise NotImplementedError`. Add all imports at the top of each file. Create the `report/` directory with empty `report_B.md`, `report_C.md`, `report_D.md` files.
 
 Then hand each team member their guide file.
 
