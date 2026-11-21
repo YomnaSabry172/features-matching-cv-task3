@@ -73,7 +73,7 @@ R = det(M) - k · trace(M)²
 3. Smooth each of those three with a Gaussian window (this is the Σ in M)
 4. Compute `R = Ixx·Iyy - Ixy² - k·(Ixx+Iyy)²`
 5. Threshold: keep pixels where `R > threshold · max(R)`
-6. **Required** (CLAUDE.md §4.6): apply non-maximum suppression (keep only local maxima)
+6. **Required** (CLAUDE.md §4.6): apply non-maximum suppression (keep only local maxima), then merge tied neighbours into one point per corner (see 1.5)
 
 ---
 
@@ -109,6 +109,8 @@ After computing R (or λ_min), many nearby pixels will all pass the threshold �
 
 Simple approach: for each pixel, check if it's the maximum in its neighborhood. If not, suppress it.
 
+**Ties (important):** on a perfectly symmetric corner (e.g. a synthetic checkerboard) several neighbouring pixels have exactly the same response, so they all equal the local maximum and plain NMS keeps all of them (4 points per corner instead of 1). Fix: after NMS, group the surviving pixels that touch each other (8-connectivity, `scipy.ndimage.label`) and keep one point per group at its centroid (`scipy.ndimage.center_of_mass`).
+
 ---
 
 ## Part 2 — Your File: harris.py
@@ -134,7 +136,7 @@ def harris_detection(img, k=0.05, threshold=0.01, window_size=3, sigma=1.0):
     # 4. trace_M = Ixx + Iyy
     # 5. R = det_M - k * trace_M**2
     # 6. keypoints = pixels where R > threshold * R.max()
-    # 7. Apply NMS
+    # 7. Apply NMS + merge tied neighbours (_extract_keypoints)
     # 8. time_ms = (time.perf_counter() - t0) * 1000
     # Returns: R, keypoints, time_ms
 
@@ -145,7 +147,7 @@ def lambda_minus_detection(img, threshold=0.01, window_size=3, sigma=1.0):
     # 4. det_M = Ixx*Iyy - Ixy**2
     # 5. lambda_min = trace_half - np.sqrt(np.maximum(trace_half**2 - det_M, 0))
     # 6. keypoints = pixels where lambda_min > threshold * lambda_min.max()
-    # 7. Apply NMS
+    # 7. Apply NMS + merge tied neighbours (_extract_keypoints)
     # 8. time_ms = (time.perf_counter() - t0) * 1000
     # Returns: lambda_min, keypoints, time_ms
 ```
@@ -153,27 +155,29 @@ def lambda_minus_detection(img, threshold=0.01, window_size=3, sigma=1.0):
 ### Code skeleton with explanation
 
 ```python
+import time
+
 import numpy as np
 import scipy.ndimage
-import time
 
 
 def compute_structure_tensor(img, sigma=1.0, window_size=3):
     """Compute M = [[Ixx, Ixy],[Ixy, Iyy]] for every pixel."""
+    # Work in float64 (Sobel on uint8 would overflow / clip).
+    img = np.asarray(img, dtype=np.float64)
+
     # Standard Harris: Sobel directly on the image, no pre-blur.
     # `sigma` is kept in the signature so the UI call doesn't break, but unused.
     Ix = scipy.ndimage.sobel(img, axis=1)   # horizontal gradient
     Iy = scipy.ndimage.sobel(img, axis=0)   # vertical gradient
 
-    # Products — these are the raw tensor components
+    # Products - the raw tensor components
     Ix2 = Ix * Ix
     Iy2 = Iy * Iy
     Ixy = Ix * Iy
 
-    # Gaussian smoothing = summing over the window
-    # (the Σ in the M formula is a weighted sum, Gaussian weights)
-    # window_size is used DIRECTLY as the sigma of the Gaussian.
-    # Rule: window_size=3 → gaussian_filter(..., sigma=3). Do NOT divide by 3.
+    # Gaussian smoothing = the weighted sum (Σ) over the window in M.
+    # window_size is used DIRECTLY as the Gaussian sigma (window_size=3 -> sigma=3).
     Ixx = scipy.ndimage.gaussian_filter(Ix2, sigma=window_size)
     Iyy = scipy.ndimage.gaussian_filter(Iy2, sigma=window_size)
     Ixy_smooth = scipy.ndimage.gaussian_filter(Ixy, sigma=window_size)
@@ -182,11 +186,31 @@ def compute_structure_tensor(img, sigma=1.0, window_size=3):
 
 
 def _nms(response_map, neighborhood=3):
-    """Keep only local maxima. Suppress everything else."""
-    from scipy.ndimage import maximum_filter
-    local_max = maximum_filter(response_map, size=neighborhood)
-    # A pixel is a local max if it equals the neighborhood max
+    """True only where a pixel equals the max of its neighborhood window."""
+    local_max = scipy.ndimage.maximum_filter(response_map, size=neighborhood)
     return response_map == local_max
+
+
+def _extract_keypoints(response_map, threshold):
+    """Relative threshold + NMS + merge ties -> list of (x, y) tuples."""
+    max_val = response_map.max()
+    # No positive peak (e.g. flat image) -> no corners.
+    if max_val <= 0:
+        return []
+
+    # Relative threshold (not clipped before: negative R just fails the test).
+    corners_mask = (response_map > threshold * max_val) & _nms(response_map)
+
+    # Symmetric corners give several tied maxima that all survive NMS.
+    # Group touching survivors (8-connectivity), keep one point per group
+    # at its centroid -> exactly one keypoint per physical corner.
+    labels, n = scipy.ndimage.label(corners_mask, structure=np.ones((3, 3), dtype=int))
+    if n == 0:
+        return []
+    centers = scipy.ndimage.center_of_mass(corners_mask, labels, range(1, n + 1))
+
+    # center_of_mass returns (row, col) -> store as (x=col, y=row)
+    return [(int(round(c)), int(round(r))) for r, c in centers]
 
 
 def harris_detection(img, k=0.05, threshold=0.01, window_size=3, sigma=1.0):
@@ -194,19 +218,14 @@ def harris_detection(img, k=0.05, threshold=0.01, window_size=3, sigma=1.0):
 
     Ixx, Ixy, Iyy = compute_structure_tensor(img, sigma, window_size)
 
+    # det(M) = λ1·λ2, trace(M) = λ1+λ2 - no eigenvalues needed
     det_M   = Ixx * Iyy - Ixy ** 2
     trace_M = Ixx + Iyy
-    R = det_M - k * trace_M ** 2
+    R = det_M - k * trace_M ** 2        # >0 corner, <0 edge, ~0 flat
 
-    # Threshold: keep only strong responses
-    threshold_val = threshold * R.max()
-    corners_mask = (R > threshold_val) & _nms(R)
+    keypoints = _extract_keypoints(R, threshold)
 
-    # Extract (x, y) positions
-    ys, xs = np.where(corners_mask)
-    keypoints = list(zip(xs.tolist(), ys.tolist()))  # (x, y) pairs
-
-    time_ms = (time.perf_counter() - t0) * 1000
+    time_ms = (time.perf_counter() - t0) * 1000.0
     return R, keypoints, time_ms
 
 
@@ -215,18 +234,16 @@ def lambda_minus_detection(img, threshold=0.01, window_size=3, sigma=1.0):
 
     Ixx, Ixy, Iyy = compute_structure_tensor(img, sigma, window_size)
 
-    trace_half = (Ixx + Iyy) / 2
+    # Closed-form eigenvalues of the 2x2 matrix: λ = trace/2 ± sqrt((trace/2)² - det)
+    trace_half = (Ixx + Iyy) / 2.0
     det_M      = Ixx * Iyy - Ixy ** 2
-    # np.maximum(..., 0) prevents negative sqrt input from numerical noise
-    lambda_min = trace_half - np.sqrt(np.maximum(trace_half ** 2 - det_M, 0))
+    # np.maximum(..., 0) prevents NaN from tiny negative values (float rounding)
+    lambda_min = trace_half - np.sqrt(np.maximum(trace_half ** 2 - det_M, 0.0))
 
-    threshold_val = threshold * lambda_min.max()
-    corners_mask  = (lambda_min > threshold_val) & _nms(lambda_min)
+    # A corner needs BOTH eigenvalues large -> threshold the smaller one
+    keypoints = _extract_keypoints(lambda_min, threshold)
 
-    ys, xs = np.where(corners_mask)
-    keypoints = list(zip(xs.tolist(), ys.tolist()))
-
-    time_ms = (time.perf_counter() - t0) * 1000
+    time_ms = (time.perf_counter() - t0) * 1000.0
     return lambda_min, keypoints, time_ms
 ```
 
@@ -256,6 +273,8 @@ def lambda_minus_detection(img, threshold=0.01, window_size=3, sigma=1.0):
 - **Threshold is relative** — `threshold * R.max()`, not an absolute pixel value.
 - **Watch for numerical noise in lambda_minus** — `trace_half² - det_M` can be slightly negative due to floating point. Use `np.maximum(..., 0)` before the sqrt.
 - **NMS neighborhood size** — 3 is a good default; makes corners single points instead of blobs.
+- **Tied maxima** — plain NMS (`response == local_max`) keeps every pixel that ties for the maximum. On a perfect synthetic checkerboard this gave 4 points per corner (196 instead of 49). `_extract_keypoints` merges touching survivors into one centroid point.
+- **Flat image** — if `max(R) <= 0` there is no corner; `_extract_keypoints` returns an empty list instead of thresholding against a zero/negative max.
 - **`sigma` is unused** — the only Gaussian smoothing is on Ix², Iy², Ix·Iy, using `window_size` (the Σ in M). `sigma` stays in the signature so the UI doesn't break, but changing it does not change the output. That is expected.
 
 ---
@@ -273,24 +292,54 @@ def lambda_minus_detection(img, threshold=0.01, window_size=3, sigma=1.0):
 **Note on sigma and kernel size:** `window_size` is passed directly as `sigma` to `scipy.ndimage.gaussian_filter`. With `sigma=3`, the "2·sigma" radius covers ~6 px (≈95% of the Gaussian weight). `gaussian_filter` defaults to `truncate=4.0`, which means the actual kernel reaches `4·sigma = 12 px` each side — a 25×25 window. So `window_size=3` does not mean a 3×3 kernel; it means a large integration window that smooths the tensor heavily. This is expected and correct behavior. Mention this in the discussion so the TA knows you understand what the parameter actually controls.
 
 ## Checklist
-- [ ] `compute_structure_tensor` returns correct Ixx, Ixy, Iyy
-- [ ] No blur before Sobel; only Gaussian is on Ix², Iy², Ix·Iy with `window_size`
-- [ ] `harris_detection` returns R map, keypoints as (x,y), time_ms
-- [ ] `lambda_minus_detection` returns lmin map, keypoints, time_ms
-- [ ] NMS applied — single point per corner, not blobs
-- [ ] No cv2.cornerHarris used anywhere
-- [ ] This guide matches your final code; every change is in the **Change Log**
-- [ ] Every part of your code has a brief comment
+- [x] `compute_structure_tensor` returns correct Ixx, Ixy, Iyy
+- [x] No blur before Sobel; only Gaussian is on Ix², Iy², Ix·Iy with `window_size`
+- [x] `harris_detection` returns R map, keypoints as (x,y), time_ms
+- [x] `lambda_minus_detection` returns lmin map, keypoints, time_ms
+- [x] NMS applied — single point per corner, not blobs
+- [x] No cv2.cornerHarris used anywhere
+- [x] This guide matches your final code; every change is in the **Change Log**
+- [x] Every part of your code has a brief comment
 - [ ] **Your Observations** filled in with screenshots and notes
 
 ---
 
 ## Your Observations
-_Fill this in: paste screenshots from the app and write what you noticed for each item in "What to Show in the Discussion"._
+_Measured on a synthetic 256×256 checkerboard (8×8 squares of 32 px → 49 inner corners). Add your own screenshots from the app on a real image where marked._
+
+**Checkerboard results (measured)**
+
+| Test | Result |
+|------|--------|
+| Corners expected | 49 |
+| Harris corners found, `window_size` = 1 / 2 / 3 | 49 / 49 / 49 |
+| Lambda-minus corners found, `window_size` = 1 / 2 / 3 | 49 / 49 / 49 |
+| Harris vs Lambda-minus locations | identical |
+| R at corners / on edges | R > 0 at corners; R min ≈ −0.86 on edges (max ≈ 8.9) |
+| Harris time (avg of 20 runs, 256×256) | ≈ 10.9 ms |
+| Lambda-minus time (avg of 20 runs, 256×256) | ≈ 9.4 ms |
+| Effect of `k` (0.04 / 0.05 / 0.06) and `threshold` (0.001–0.5) | no change in count on the clean checkerboard (all 49) |
+
+**What I noticed**
+- Without merging tied maxima, plain NMS gave 196 points (4 per corner) because the response is exactly symmetric around a perfect corner. Merging touching survivors gives one point per corner (see Change Log).
+- On a clean checkerboard the corner strength is so much larger than everything else that `k`, `threshold` and `window_size` don't change the count. These parameters only show their effect on a real, textured image.
+- In this run Lambda-minus was slightly faster than Harris, but the difference is about 1 ms and within timing noise; both are the same order of magnitude. The extra `sqrt` in Lambda-minus did not make it noticeably slower.
+
+**To add from the app (real image):**
+- [ ] Screenshot: Harris response map + corner overlay
+- [ ] Screenshot: Lambda-minus map + corner overlay
+- [ ] Effect of `k` = 0.04 / 0.05 / 0.06 (corner counts)
+- [ ] Effect of `threshold` on number of corners
+- [ ] Effect of `window_size` = 1 / 2 / 3 at a fixed threshold (corner counts + what you saw on the R peaks)
+- [ ] Harris vs Lambda-minus timing on the real image
 
 ## Change Log
-_Mandatory: every change you made compared to this guide (concept or code), and why._
+_Every change compared to the original guide (concept or code), and why._
 
 | What changed | Why |
 |--------------|-----|
-|              |     |
+| Added `_extract_keypoints()` that runs threshold + NMS, then merges touching survivors into one centroid point (`scipy.ndimage.label` + `center_of_mass`) | Plain NMS (`R == maximum_filter(R)`) keeps all tied maxima. On a perfect checkerboard it returned 196 points (4 per corner) instead of 49. |
+| Both detectors now call `_extract_keypoints()` instead of building the mask inline | Removes duplicated code; same behaviour for Harris and Lambda-minus |
+| Return an empty keypoint list when `max(R) <= 0` | A flat image has no positive peak; thresholding against a zero/negative max would be meaningless |
+| `compute_structure_tensor` converts input with `np.asarray(img, dtype=np.float64)` | Prevents Sobel overflow/clipping if a uint8 image is passed by mistake |
+| Added concept note on ties (1.5), updated step 6 and pseudo-code step 7, added two Gotchas, replaced the code skeleton | Keep the guide identical to the final code (Hard Rule 8) |
