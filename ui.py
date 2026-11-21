@@ -18,11 +18,11 @@ import traceback
 import cv2
 import numpy as np
 from PyQt5.QtCore import QObject, QRectF, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QPainter
+from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PyQt5.QtWidgets import (
     QApplication, QFileDialog, QFrame, QGraphicsScene, QGraphicsView,
     QHBoxLayout, QLabel, QMainWindow, QProgressBar, QPushButton,
-    QScrollArea, QSlider, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSlider, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 import harris
@@ -61,11 +61,12 @@ QLabel#AppSubtitle {{ color: {TEXT_MUTED}; }}
 QTabWidget::pane {{ border: none; background: {INDIGO}; border-radius: 14px; }}
 QTabBar::tab {{
     background: {INDIGO_DEEP}; color: {TEXT_MUTED};
-    padding: 12px 28px; margin-right: 6px;
+    padding: 10px 18px; margin-right: 6px;
     border-top-left-radius: 10px; border-top-right-radius: 10px;
 }}
 QTabBar::tab:selected {{ background: {INDIGO}; color: {SAND}; border-bottom: 4px solid {TANGERINE}; }}
 QTabBar::tab:hover:!selected {{ color: {SAND}; }}
+QTabBar QToolButton {{ background: {INDIGO_CARD}; color: {SAND}; border: none; border-radius: 6px; }}
 
 QWidget#Sidebar {{ background: {INDIGO_CARD}; border-radius: 14px; }}
 QScrollArea#SidebarScroll {{ background: transparent; border: none; }}
@@ -468,6 +469,7 @@ class Banner(QLabel):
         super().__init__()
         self.setObjectName("Banner")
         self.setWordWrap(True)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.hide()
 
     def show_msg(self, kind: str, text: str) -> None:
@@ -512,7 +514,18 @@ def muted(text: str) -> QLabel:
     lbl = QLabel(text)
     lbl.setObjectName("Muted")
     lbl.setWordWrap(True)
+    lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
     return lbl
+
+
+def _set_file_label(label: QLabel, path: str, w: int, h: int, prefix: str = "") -> None:
+    """Middle-elide long unbroken filenames so they fit inside the fixed-width sidebar."""
+    fm = QFontMetrics(label.font())
+    suffix = f"  ·  {w}×{h}"
+    max_name_px = max(120, 320 - fm.horizontalAdvance(prefix + suffix))
+    name = fm.elidedText(os.path.basename(path), Qt.ElideMiddle, max_name_px)
+    label.setText(f"{prefix}{name}{suffix}")
+    label.setToolTip(path)
 
 
 def primary(text: str) -> QPushButton:
@@ -527,7 +540,7 @@ def fmt_ms(ms: float) -> str:
 
 
 IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"
-LARGE_SIDE = 1000   # SIFT's pixel loop gets slow above this
+LARGE_SIDE = 1000   # SIFT gets noticeably slower above this
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +552,7 @@ class _TabBase(QWidget):
         self._busy = False
         self._pending = None        # auto-run requested while busy → run after
         self._lock = []             # widgets disabled while busy
+        self._drop_views = []       # ImageViews whose drops are disabled while busy
         root = QHBoxLayout(self)
         root.setContentsMargins(18, 18, 18, 18)
         root.setSpacing(18)
@@ -599,6 +613,8 @@ class _TabBase(QWidget):
         self.progress.setVisible(busy)
         for w in self._lock:
             w.setEnabled(not busy)
+        for v in self._drop_views:
+            v.setAcceptDrops(not busy)
 
     def _ask_open(self) -> str:
         path, _ = QFileDialog.getOpenFileName(self, "Load image", "", IMAGE_FILTER)
@@ -627,8 +643,8 @@ class _TabBase(QWidget):
     def _size_warning(self, rgb: np.ndarray) -> str:
         h, w = rgb.shape[:2]
         if max(h, w) > LARGE_SIDE:
-            return (f" Large image ({w}×{h}): SIFT's pixel-loop detection may take minutes."
-                    f" Around 500 px wide is comfortable for a demo.")
+            return (f" Large image ({w}×{h}): SIFT may take several seconds."
+                    f" Around 500 px wide is fastest for a demo.")
         return ""
 
 
@@ -645,6 +661,7 @@ class DetectionTab(_TabBase):
         self._path = ""
         self._rgb = self._gray = None
         self._overlay = self._heat = None
+        self._last_method = "harris"
 
         lay = QHBoxLayout(self.content)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -689,6 +706,7 @@ class DetectionTab(_TabBase):
         self._add_stats(self.st_time, self.st_count)
 
         self._lock = [self.btn_load, self.btn_run, self.btn_save]
+        self._drop_views = [self.view_img, self.view_resp]
         self.btn_load.clicked.connect(lambda: self.load_path(self._ask_open()))
         self.btn_run.clicked.connect(self.run)
         self.btn_save.clicked.connect(self.save)
@@ -703,7 +721,7 @@ class DetectionTab(_TabBase):
             self._auto(self.run)
 
     def load_path(self, path: str):
-        if not path:
+        if self._busy or not path:
             return
         rgb = self._read(path)
         if rgb is None:
@@ -714,7 +732,7 @@ class DetectionTab(_TabBase):
         self.view_img.set_image(rgb)
         self.view_resp.clear()
         h, w = rgb.shape[:2]
-        self.lbl_file.setText(f"{os.path.basename(path)}  ·  {w}×{h}")
+        _set_file_label(self.lbl_file, path, w, h)
         self.st_time.set("—")
         self.st_count.set("—")
         self.banner.show_msg("info", "Image loaded. Press “Run Detection”.")
@@ -728,27 +746,30 @@ class DetectionTab(_TabBase):
 
         def job():
             if method == "harris":
-                return harris.harris_detection(gray, k=k, threshold=thr, window_size=win)
-            return harris.lambda_minus_detection(gray, threshold=thr, window_size=win)
+                resp, corners, ms = harris.harris_detection(gray, k=k, threshold=thr, window_size=win)
+            else:
+                resp, corners, ms = harris.lambda_minus_detection(gray, threshold=thr, window_size=win)
+            return dict(resp=resp, corners=corners, ms=ms, method=method)
 
         self._start(job, self._show, "Detecting corners…")
 
     def _show(self, result):
-        resp, corners, ms = result
+        resp, corners, ms, method = result["resp"], result["corners"], result["ms"], result["method"]
+        self._last_method = method
         self._overlay = draw_corners(self._rgb, corners)
         self._heat = response_heatmap(resp)
         self.view_img.set_image(self._overlay)
         self.view_resp.set_image(self._heat)
         self.st_time.set(fmt_ms(ms))
         self.st_count.set(str(len(corners)))
-        name = "Harris" if self.method.value() == "harris" else "λ-minus"
+        name = "Harris" if method == "harris" else "λ-minus"
         self.banner.show_msg("ok", f"{name}: {len(corners)} corners in {fmt_ms(ms)}.")
 
     def save(self):
         if self._overlay is None:
             self.banner.show_msg("info", "Run detection first — there is no result to save yet.")
             return
-        path = self._ask_save(f"{_stem(self._path)}_{self.method.value()}_corners.png")
+        path = self._ask_save(f"{_stem(self._path)}_{self._last_method}_corners.png")
         if not path:
             return
         root, ext = os.path.splitext(path)
@@ -837,6 +858,7 @@ class SiftTab(_TabBase):
         self._add_stats(self.st_build, self.st_detect, self.st_desc, self.st_count)
 
         self._lock = [self.btn_load, self.btn_run, self.btn_save]
+        self._drop_views = [self.view]
         self.btn_load.clicked.connect(lambda: self.load_path(self._ask_open()))
         self.btn_run.clicked.connect(self.run)
         self.btn_save.clicked.connect(self.save)
@@ -851,14 +873,19 @@ class SiftTab(_TabBase):
         return (self.p_oct.value(), self.p_sc.value(), self.p_s0.value(), self.p_thr.value())
 
     def _ss_settings_changed(self):
-        if self._t2_scale_space is not None and self._ss_key() != self._t2_ss_key:
+        if self._t2_scale_space is None:
+            return
+        if self._ss_key() != self._t2_ss_key:
             self.lbl_cache.setText("Scale space: settings changed — “Run SIFT” will rebuild it")
+        else:
+            n_oct, n_sc, s0 = self._t2_ss_key
+            self.lbl_cache.setText(f"Scale space: cached ✓  ({n_oct} octaves × {n_sc} scales, σ0={s0})")
 
     def _ss_key(self) -> tuple:
         return self.settings()[:3]
 
     def load_path(self, path: str):
-        if not path:
+        if self._busy or not path:
             return
         rgb = self._read(path)
         if rgb is None:
@@ -870,7 +897,7 @@ class SiftTab(_TabBase):
         self._t2_kp = self._t2_desc = self._t2_result_img = None
         self.view.set_image(rgb)
         h, w = rgb.shape[:2]
-        self.lbl_file.setText(f"{os.path.basename(path)}  ·  {w}×{h}")
+        _set_file_label(self.lbl_file, path, w, h)
         self.lbl_cache.setText("Scale space: not built yet")
         for c in (self.st_build, self.st_detect, self.st_desc, self.st_count):
             c.set("—")
@@ -899,7 +926,7 @@ class SiftTab(_TabBase):
 
         text = ("Reusing cached scale space — detecting keypoints…" if cached
                 else "Building scale space and detecting keypoints…")
-        self._start(job, self._show, text + " (pixel-loop detection can take a while)")
+        self._start(job, self._show, text)
 
     def _show(self, r):
         rebuilt = r["build_ms"] is not None
@@ -943,6 +970,7 @@ class MatchingTab(_TabBase):
         self._t3_kp2 = self._t3_desc2 = self._t3_key2 = None
         self._t3_sift_ms = {1: 0.0, 2: 0.0}
         self._t3_result_img = None
+        self._last_method = "ssd"
 
         split = QSplitter(Qt.Vertical)
         split.setHandleWidth(14)
@@ -995,6 +1023,7 @@ class MatchingTab(_TabBase):
         self._add_stats(self.st_sift1, self.st_sift2, self.st_match, self.st_count)
 
         self._lock = [self.btn_load1, self.btn_load2, self.btn_run, self.btn_save]
+        self._drop_views = [self.view1, self.view2]
         self.btn_load1.clicked.connect(lambda: self.load_path(1, self._ask_open()))
         self.btn_load2.clicked.connect(lambda: self.load_path(2, self._ask_open()))
         self.btn_run.clicked.connect(self.run)
@@ -1019,7 +1048,7 @@ class MatchingTab(_TabBase):
         return all(self._cache(i)[1] is not None and self._cache(i)[2] == key for i in (1, 2))
 
     def load_path(self, i: int, path: str):
-        if not path:
+        if self._busy or not path:
             return
         rgb = self._read(path)
         if rgb is None:
@@ -1031,8 +1060,7 @@ class MatchingTab(_TabBase):
         (self.view1 if i == 1 else self.view2).set_image(rgb)
         self.view_res.clear()
         h, w = rgb.shape[:2]
-        (self.lbl_file1 if i == 1 else self.lbl_file2).setText(
-            f"Image {i}: {os.path.basename(path)}  ·  {w}×{h}")
+        _set_file_label(self.lbl_file1 if i == 1 else self.lbl_file2, path, w, h, prefix=f"Image {i}: ")
         (self.st_sift1 if i == 1 else self.st_sift2).set("—")
         self.st_match.set("—")
         self.st_count.set("—")
@@ -1062,12 +1090,12 @@ class MatchingTab(_TabBase):
             matches, match_ms = match_fn(out[1][1], out[2][1], ratio)
             return dict(per_image=out, key=settings, matches=matches, match_ms=match_ms, method=method)
 
-        text = (f"Running SIFT on image {' and '.join(map(str, todo))}, then matching… "
-                "(pixel-loop detection can take a while)" if todo
+        text = (f"Running SIFT on image {' and '.join(map(str, todo))}, then matching…" if todo
                 else "Re-matching cached descriptors…")
         self._start(job, self._show, text)
 
     def _show(self, r):
+        self._last_method = r["method"]
         cards = {1: self.st_sift1, 2: self.st_sift2}
         for i, (kp, desc, ms, fresh) in r["per_image"].items():
             if fresh:
@@ -1087,7 +1115,7 @@ class MatchingTab(_TabBase):
         if self._t3_result_img is None:
             self.banner.show_msg("info", "Run matching first — there is no result to save yet.")
             return
-        name = f"{_stem(self._path[1])}_vs_{_stem(self._path[2])}_{self.method.value()}.png"
+        name = f"{_stem(self._path[1])}_vs_{_stem(self._path[2])}_{self._last_method}.png"
         path = self._ask_save(name)
         if path and self._save(path, self._t3_result_img):
             self.banner.show_msg("ok", f"Saved {os.path.basename(path)}")
@@ -1128,7 +1156,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         # Tab font set in code, not the stylesheet: Qt sizes tabs from the widget
         # font, so a stylesheet-only font makes the labels get clipped.
-        tab_font = QFont("Segoe UI", 14)
+        tab_font = QFont("Segoe UI", 12)
         tab_font.setWeight(QFont.DemiBold)
         tabs.tabBar().setFont(tab_font)
         tabs.tabBar().setElideMode(Qt.ElideNone)

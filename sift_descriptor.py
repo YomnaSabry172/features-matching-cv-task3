@@ -25,6 +25,8 @@ def compute_orientations(
     (angle in degrees, 0–360).
     """
     # --- Precompute image gradients once for all keypoints ---
+    # Ensure float64 so Sobel never overflows/clips on uint8 input.
+    img = np.asarray(img, dtype=np.float64)
     # Sobel along x (columns) gives horizontal gradient Ix
     Ix = scipy.ndimage.sobel(img, axis=1)
     # Sobel along y (rows) gives vertical gradient Iy
@@ -63,8 +65,8 @@ def compute_orientations(
                            minlength=num_bins)
 
         # Dominant orientation = center angle of the peak bin
-        peak_bin = np.argmax(hist)
-        kp['orientation'] = peak_bin * bin_width  # degrees, in [0, 360)
+        peak_bin = int(np.argmax(hist))
+        kp['orientation'] = (peak_bin + 0.5) * bin_width  # degrees, in [0, 360)
 
     return keypoints
 
@@ -88,6 +90,8 @@ def compute_descriptors(
     t0 = time.perf_counter()
 
     # --- Precompute image gradients once for all keypoints ---
+    # Ensure float64 so Sobel never overflows/clips on uint8 input.
+    img = np.asarray(img, dtype=np.float64)
     Ix = scipy.ndimage.sobel(img, axis=1)  # horizontal gradient
     Iy = scipy.ndimage.sobel(img, axis=0)  # vertical gradient
     magnitude = np.sqrt(Ix**2 + Iy**2)     # gradient strength

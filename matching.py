@@ -90,7 +90,7 @@ def match_ncc(
     idx1, idx2 = _valid_rows(n1), _valid_rows(n2)
 
     ncc = n1[idx1] @ n2[idx2].T          # in [-1, 1], 1 = identical
-    dist = 1.0 - ncc                     # in [0, 2], 0 = identical
+    dist = np.maximum(1.0 - ncc, 0.0)    # in [0, 2], clamp tiny negatives from float rounding
 
     matches = _ratio_test(dist, idx1, idx2, threshold)
     time_ms = (time.perf_counter() - t0) * 1000

@@ -33,8 +33,8 @@ Before describing the patch, we figure out which way the gradient mostly points 
 1. Take a window of radius ~1.5·`sigma_img` around the keypoint (`sigma_img` = keypoint size in original-image pixels, provided by C).
 2. Compute gradient magnitude and direction at every pixel in the window.
 3. Build a 36-bin histogram (each bin = 10°, covering 0°–360°).
-4. Weight contributions by gradient magnitude and by distance from the keypoint (Gaussian weight).
-5. Find the peak bin — that angle is the dominant orientation.
+4. Weight contributions by gradient magnitude (a Gaussian spatial weight centered on the keypoint is an optional full-SIFT refinement).
+5. Find the peak bin — that bin's center angle `(peak_bin + 0.5) × bin_width` is the dominant orientation.
 6. If another bin is within 80% of the peak, create a second keypoint with that orientation (this improves robustness, but it's optional for the assignment).
 
 **Why we do this:** by rotating our descriptor computation to align with this dominant orientation, the descriptor becomes the same no matter how the image is rotated. That's orientation invariance.
@@ -146,6 +146,7 @@ def compute_orientations(img, keypoints, num_bins=36):
     Modifies keypoints in place (adds 'orientation' key) and returns them.
     """
     # Precompute gradient magnitude and direction for the whole image
+    img = np.asarray(img, dtype=np.float64)
     Ix = scipy.ndimage.sobel(img, axis=1)
     Iy = scipy.ndimage.sobel(img, axis=0)
     magnitude = np.sqrt(Ix**2 + Iy**2)
@@ -172,8 +173,8 @@ def compute_orientations(img, keypoints, num_bins=36):
         hist = np.bincount(bins.ravel(), weights=patch_mag.ravel(), minlength=num_bins)
 
         # Dominant orientation = peak bin's center angle
-        peak_bin = np.argmax(hist)
-        kp['orientation'] = peak_bin * bin_width   # degrees
+        peak_bin = int(np.argmax(hist))
+        kp['orientation'] = (peak_bin + 0.5) * bin_width   # degrees, in [0, 360)
 
     return keypoints
 
@@ -185,6 +186,7 @@ def compute_descriptors(img, keypoints):
     """
     t0 = time.perf_counter()
 
+    img = np.asarray(img, dtype=np.float64)
     Ix = scipy.ndimage.sobel(img, axis=1)
     Iy = scipy.ndimage.sobel(img, axis=0)
     magnitude = np.sqrt(Ix**2 + Iy**2)
@@ -346,48 +348,54 @@ kp = {
 _Observations and benchmark experiments performed using keypoints detected by `sift_detector.py` and matched with `matching.py`._
 
 ### 1. Keypoints with orientation arrows
-- **Observation:** Keypoints detected across scales have their local gradient orientation assigned accurately.
-- Scale is indicated by the green circle radius ( = \sigma_{\text{img}}$) and dominant orientation is indicated by the orange directional arrow.
-- Keypoints with larger $\sigma$ naturally encompass broader neighborhoods, capturing macro-features, while smaller $\sigma$ keypoints pinpoint sharp local corners.
-- Asset generated: [1_keypoints_orientations.png](file:///c:/Users/Lap%20Market/Desktop/ComputerVision/features-matching-cv-task3/observations_assets/1_keypoints_orientations.png)
+- **Observation:** Keypoints detected across scales have their local gradient orientation assigned accurately (`123` keypoints on the synthetic geometric test scene).
+- Scale is indicated by the green circle radius (`r = sigma_img`) and dominant orientation is indicated by the orange directional arrow.
+- Keypoints with larger `sigma` naturally encompass broader neighborhoods, capturing macro-features, while smaller `sigma` keypoints pinpoint sharp local corners.
+- ![Keypoints with orientation arrows](../observations_assets/1_keypoints_orientations.png)
 
 ### 2. Descriptor visualization (4×4 grid of 8-spoke wheels)
-- **Observation:** Each keypoint descriptor consists of 16 spatial sub-regions (\times 4$ blocks), each having an 8-bin orientation histogram (covering ^\circ$ in ^\circ$ increments).
-- Visualizing these 16 sub-regions as polar bar charts (“8-spoke wheels”) illustrates how spatial layout is preserved: adjacent blocks often exhibit smoothly varying dominant directions, capturing the local edge geometry of the patch.
-- Asset generated: [2_descriptor_wheels.png](file:///c:/Users/Lap%20Market/Desktop/ComputerVision/features-matching-cv-task3/observations_assets/2_descriptor_wheels.png)
+- **Observation:** Each keypoint descriptor consists of 16 spatial sub-regions (`4×4` blocks), each having an 8-bin orientation histogram (covering `360°` in `45°` increments).
+- Visualizing these 16 sub-regions for keypoint `(96, 176)` (`orientation = 95.0°`, `sigma_img = 18.10`) as polar bar charts ("8-spoke wheels") illustrates how spatial layout is preserved: adjacent blocks capture distinct local edge orientations across the patch.
+- ![Descriptor 4x4 grid of 8-spoke wheels](../observations_assets/2_descriptor_wheels.png)
 
 ### 3. Two matching keypoints from two images (Rotation Invariance)
-- **Observation:** An image and its ^\circ$-rotated counterpart were processed through the complete SIFT pipeline.
-- Corresponding keypoints across the two images produced virtually identical 128-dimensional descriptor vectors:
-  - **Cosine Similarity:** **0.9838** (near-perfect correlation)
-  - **L2 Distance:** **0.1802**
-- This validates that rotating both the spatial grid (by $-\theta$) and the gradient angles (subtracting $\theta$) achieves robust rotation invariance.
-- Asset generated: [3_descriptor_comparison.png](file:///c:/Users/Lap%20Market/Desktop/ComputerVision/features-matching-cv-task3/observations_assets/3_descriptor_comparison.png)
+- **Observation:** The `512×512` `ascent` image (`760` keypoints) and a `30°`-rotated counterpart (`567` keypoints) were processed through the complete SIFT pipeline (`355` total SSD matches, `219` geometrically verified inliers within `8 px`).
+- Corresponding keypoints across the two images produced nearly identical 128-dimensional descriptor vectors (e.g. KP `289` at `(404, 459)` matched to rotated KP `133` at `(486, 358)`):
+  - **Cosine Similarity:** **0.9972**
+  - **L2 Distance:** **0.0748**
+- This validates that rotating both the spatial grid (by `-θ`) and the gradient angles (subtracting `θ`) achieves robust rotation invariance even at arbitrary non-90° angles.
+- ![Matched descriptor comparison under 30° rotation](../observations_assets/3_descriptor_comparison.png)
 
 ### 4. Effect of clipping threshold (0.05 to 1.0)
-- **Observation:** Tested descriptor matching (Lowe’s ratio test $< 0.8$) under varying clipping thresholds:
-  - Threshold = 0.05: **19 matches** (over-clipping washes out distinctiveness)
-  - Threshold = 0.10: **25 matches**
-  - Threshold = 0.15: **34 matches**
-  - **Threshold = 0.20: 36 matches (Optimal Peak)**
-  - Threshold = 0.25: **34 matches**
-  - Threshold = 0.30: **32 matches**
-  - Threshold = 1.00 (no clipping): **29 matches**
-- **Conclusion:** Clipping at **0.20** maximizes the number of robust matches by dampening non-linear illumination artifacts and extreme gradient spikes without destroying vector distinctiveness.
-- Asset generated: [4_clipping_effect.png](file:///c:/Users/Lap%20Market/Desktop/ComputerVision/features-matching-cv-task3/observations_assets/4_clipping_effect.png)
+- **Observation:** Tested SSD descriptor matching (Lowe's ratio test `< 0.8`) between `512×512` `ascent` and its `30°`-rotated version across clipping thresholds:
+
+| Clipping Threshold | Total SSD Matches | Geometrically Verified Inliers (`≤ 8 px`) |
+|---|---|---|
+| `0.05` | 342 | 239 |
+| `0.10` | **359** | **246** |
+| `0.15` | 356 | 229 |
+| `0.20` (SIFT default) | 355 | 219 |
+| `0.25` | 341 | 210 |
+| `0.30` | 328 | 207 |
+| `0.40` | 321 | 205 |
+| `1.00` (no clipping) | 322 | 203 |
+
+- **Conclusion:** Clipping around **0.10–0.20** substantially increases both total matches (`355–359` vs `322` unclipped) and geometrically verified inliers (`219–246` vs `203` unclipped) by dampening extreme gradient spikes from single dominant edges. Over-clipping down to `0.05` begins flattening valid peaks and drops total matches (`342`).
+- ![Effect of clipping threshold](../observations_assets/4_clipping_effect.png)
 
 ### 5. Timing: compute_orientations vs compute_descriptors
-- **Observation:** Averaged over multiple runs for  = 70$ keypoints:
-  - **`compute_orientations`:** **~35.1 ms** (~0.50 ms / keypoint)
-  - **`compute_descriptors`:** **~143.5 ms** (~2.05 ms / keypoint)
-- **Reason:** `compute_descriptors` takes approximately \times$ longer than `compute_orientations` because it performs \text{D}$ coordinate rotation grid transforms, pixel-in-polygon filtering, and generates 16 separate 8-bin histograms with double normalization and threshold clipping per keypoint, whereas orientation assignment only needs a single local histogram.
-- Asset generated: [5_timing_breakdown.png](file:///c:/Users/Lap%20Market/Desktop/ComputerVision/features-matching-cv-task3/observations_assets/5_timing_breakdown.png)
+- **Observation:** Averaged over 10 runs on `512×512` `ascent` (`N = 760` keypoints):
+  - **`compute_orientations`:** **105.47 ms** (`0.139 ms / keypoint`)
+  - **`compute_descriptors`:** **501.59 ms** (`0.660 ms / keypoint`)
+- **Reason:** `compute_descriptors` takes **4.76×** longer than `compute_orientations` because it constructs rotated `2D` coordinate grids per keypoint, filters pixels inside the rotated `16×16` patch, accumulates 16 separate 8-bin histograms via `np.add.at`, and applies double L2 normalization with clipping, whereas orientation assignment only builds a single 36-bin histogram per keypoint.
+- ![Timing breakdown](../observations_assets/5_timing_breakdown.png)
 
 ## Change Log
 _Mandatory: every change you made compared to this guide (concept or code), and why._
 
 | What changed | Why |
 |--------------|-----|
-| Implementation follows the guide skeleton exactly | The code skeleton in Part 2 was clear and complete — no algorithmic changes were needed |
-| Used uniform spatial weights in `compute_orientations` (no Gaussian weighting) | Guide §1.2 notes this as the simple version that still works; Gaussian weight is a full-SIFT refinement marked as optional |
-| No secondary orientation assignment (80% peak check) | Guide §1.2 step 6 marks this as optional for the assignment — skipped for simplicity |
+| Implementation follows the guide skeleton with uniform spatial weights in `compute_orientations` and no secondary orientation split | Guide §1.2 marks Gaussian spatial weights and the 80% secondary-peak split as optional refinements |
+| Fixed dominant orientation angle to use bin center `(peak_bin + 0.5) * bin_width` instead of bin lower edge `peak_bin * bin_width` | Eliminates the systematic 5° half-bin bias and matches the docstring/comment intent |
+| Cast input image with `np.asarray(img, dtype=np.float64)` at the top of `compute_orientations` and `compute_descriptors` | Prevents Sobel integer overflow/clipping if a `uint8` image is passed directly |
+| Synced §1.2 Step 4, code skeleton, relative image paths (`../observations_assets/...`), and fixed corrupted observation metrics/plots | Keep the guide accurate, portable across machines, and identical to the final code (Hard Rule 8) |
