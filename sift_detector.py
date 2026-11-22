@@ -96,17 +96,9 @@ def detect_keypoints(
     """
     t0 = time.perf_counter()
     keypoints = []
-    # Require at least 1 pixel of border so 3x3 neighborhood filters stay interior.
-    b = max(1, int(border))
-    # 8-neighbour footprint in the same DoG layer (center pixel excluded).
-    ring = np.ones((3, 3), dtype=bool)
-    ring[1, 1] = False
 
     for octave_idx, octave_dog in enumerate(dog):
         n_layers = len(octave_dog)
-        # Need at least 3 DoG layers (below, current, above) to test 3D extrema.
-        if n_layers < 3:
-            continue
         k = 2 ** (1.0 / (n_layers - 2))   # n_layers - 2 == n_scales - 3 == s
         scale_up = 2 ** octave_idx         # octave pixels → original pixels
 
@@ -114,40 +106,31 @@ def detect_keypoints(
         for s in range(1, n_layers - 1):
             prev, curr, nxt = octave_dog[s - 1], octave_dog[s], octave_dog[s + 1]
             H, W = curr.shape
-            # Skip octaves whose downsampled image has no interior outside the border.
-            if H <= 2 * b or W <= 2 * b:
-                continue
             sigma = sigma0 * k ** s          # in this octave's pixels
 
-            # Vectorized 26-neighbour extrema check: 8 in current layer + 9 below + 9 above.
-            max_same = scipy.ndimage.maximum_filter(curr, footprint=ring)
-            min_same = scipy.ndimage.minimum_filter(curr, footprint=ring)
-            max_prev = scipy.ndimage.maximum_filter(prev, size=3)
-            min_prev = scipy.ndimage.minimum_filter(prev, size=3)
-            max_next = scipy.ndimage.maximum_filter(nxt, size=3)
-            min_next = scipy.ndimage.minimum_filter(nxt, size=3)
+            # Check every pixel (excluding border)
+            for y in range(border, H - border):
+                for x in range(border, W - border):
+                    val = curr[y, x]
 
-            # Strictly larger or strictly smaller than all 26 neighbours + contrast threshold.
-            is_max = (curr > max_same) & (curr > max_prev) & (curr > max_next)
-            is_min = (curr < min_same) & (curr < min_prev) & (curr < min_next)
-            mask = (is_max | is_min) & (np.abs(curr) >= threshold)
+                    # Discard low contrast first (saves time)
+                    if abs(val) < threshold:
+                        continue
 
-            # Exclude border pixels (b >= 1 guarantees -b is strictly negative).
-            mask[:b, :] = False
-            mask[-b:, :] = False
-            mask[:, :b] = False
-            mask[:, -b:] = False
+                    # 3×3×3 cube: layer below, same layer, layer above → 27 values
+                    cube = np.stack([prev[y-1:y+2, x-1:x+2],
+                                     curr[y-1:y+2, x-1:x+2],
+                                     nxt [y-1:y+2, x-1:x+2]]).ravel()
+                    # Remove the center itself (index 13 of 27) → 26 neighbours
+                    neighbours = np.delete(cube, 13)
 
-            ys, xs = np.where(mask)
-            for y, x in zip(ys.tolist(), xs.tolist()):
-                keypoints.append({
-                    'x': x, 'y': y,
-                    'x_img': x * scale_up, 'y_img': y * scale_up,
-                    'octave': octave_idx,
-                    'scale': s,
-                    'sigma': sigma,
-                    'sigma_img': sigma * scale_up,
-                })
-
-    time_ms = (time.perf_counter() - t0) * 1000
-    return keypoints, time_ms
+                    # Strictly larger or strictly smaller than ALL 26
+                    if val > neighbours.max() or val < neighbours.min():
+                        keypoints.append({
+                            'x': x, 'y': y,
+                            'x_img': x * scale_up, 'y_img': y * scale_up,
+                            'octave': octave_idx,
+                            'scale': s,
+                            'sigma': sigma,
+                            'sigma_img': sigma * scale_up,
+                        })
