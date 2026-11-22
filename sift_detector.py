@@ -134,3 +134,5 @@ def detect_keypoints(
                             'sigma': sigma,
                             'sigma_img': sigma * scale_up,
                         })
+    time_ms = (time.perf_counter() - t0) * 1000
+    return keypoints, time_ms                    
